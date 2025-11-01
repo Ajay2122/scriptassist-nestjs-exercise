@@ -1,12 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, In } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
+import { TaskFilterDto } from './dto/task-filter.dto';
+import { BatchOperationDto, BatchOperationType } from './dto/batch-operation.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
+import { PaginatedResponse } from '../../types/paginated-response.interface';
+import { CacheService } from '../../common/services/cache.service';
+import { TASK_CACHE_PATTERNS } from './constants/cache-keys';
 
 @Injectable()
 export class TasksService {
@@ -15,76 +20,224 @@ export class TasksService {
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
+    private readonly cacheService: CacheService,
   ) {}
 
   async create(createTaskDto: CreateTaskDto): Promise<Task> {
-    // Inefficient implementation: creates the task but doesn't use a single transaction
-    // for creating and adding to queue, potential for inconsistent state
-    const task = this.tasksRepository.create(createTaskDto);
-    const savedTask = await this.tasksRepository.save(task);
+    const queryRunner = this.tasksRepository.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    // Add to queue without waiting for confirmation or handling errors
-    this.taskQueue.add('task-status-update', {
-      taskId: savedTask.id,
-      status: savedTask.status,
-    });
+    try {
+      const task = this.tasksRepository.create(createTaskDto);
+      const savedTask = await queryRunner.manager.save(task);
 
-    return savedTask;
+      await this.taskQueue.add('task-status-update', {
+        taskId: savedTask.id,
+        status: savedTask.status,
+      }, {
+        attempts: 3,
+        backoff: 5000
+      });
+
+      await queryRunner.commitTransaction();
+      
+      // Invalidate task list cache since we added a new task
+      await this.cacheService.clear('tasks');
+      
+      return savedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new HttpException(
+        'Failed to create task',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    } finally {
+      await queryRunner.release();
+    }
   }
 
-  async findAll(): Promise<Task[]> {
-    // Inefficient implementation: retrieves all tasks without pagination
-    // and loads all relations, causing potential performance issues
-    return this.tasksRepository.find({
-      relations: ['user'],
-    });
+  async findAll(filter: TaskFilterDto): Promise<PaginatedResponse<Task>> {
+    const { 
+      page = 1, 
+      limit = 10, 
+      status, 
+      priority, 
+      userId, 
+      search,
+      startDate,
+      endDate,
+      sortBy = 'createdAt',
+      sortOrder = 'DESC'
+    } = filter;
+
+    const cacheKey = `tasks:${JSON.stringify(filter)}`;
+    const cached = await this.cacheService.get<PaginatedResponse<Task>>(cacheKey);
+
+    if (cached) {
+      return cached;
+    }
+
+    const queryBuilder = this.tasksRepository
+      .createQueryBuilder('task')
+      .leftJoinAndSelect('task.user', 'user')
+      .skip((page - 1) * limit)
+      .take(limit);
+
+    // Add filters
+    if (status) {
+      queryBuilder.andWhere('task.status = :status', { status });
+    }
+
+    if (priority) {
+      queryBuilder.andWhere('task.priority = :priority', { priority });
+    }
+
+    if (userId) {
+      queryBuilder.andWhere('task.userId = :userId', { userId });
+    }
+
+    if (search) {
+      queryBuilder.andWhere(
+        '(task.title ILIKE :search OR task.description ILIKE :search)',
+        { search: `%${search}%` }
+      );
+    }
+
+    if (startDate) {
+      queryBuilder.andWhere('task.createdAt >= :startDate', { startDate });
+    }
+
+    if (endDate) {
+      queryBuilder.andWhere('task.createdAt <= :endDate', { endDate });
+    }
+
+    // Add sorting
+    queryBuilder.orderBy(`task.${sortBy}`, sortOrder);
+
+    // Execute query
+    const [items, totalItems] = await queryBuilder.getManyAndCount();
+
+    const totalPages = Math.ceil(totalItems / limit);
+
+    const result = {
+      items,
+      meta: {
+        page,
+        limit,
+        totalItems,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1
+      }
+    };
+
+    await this.cacheService.set(cacheKey, result, { ttl: 60 }); // Cache for 1 minute since task list changes frequently
+    return result;
   }
 
   async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    const count = await this.tasksRepository.count({ where: { id } });
+    const cacheKey = TASK_CACHE_PATTERNS.SINGLE_TASK(id);
+    const cached = await this.cacheService.get<Task>(cacheKey);
 
-    if (count === 0) {
-      throw new NotFoundException(`Task with ID ${id} not found`);
+    if (cached) {
+      return cached;
     }
 
-    return (await this.tasksRepository.findOne({
+    const task = await this.tasksRepository.findOne({
       where: { id },
       relations: ['user'],
-    })) as Task;
+    });
+
+    if (!task) {
+      throw new NotFoundException(`Task not found`);
+    }
+
+    await this.cacheService.set(cacheKey, task, { ttl: 300 }); // Cache for 5 minutes
+    return task;
   }
 
   async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
-    const task = await this.findOne(id);
+    const queryRunner = this.tasksRepository.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    const originalStatus = task.status;
-
-    // Directly update each field individually
-    if (updateTaskDto.title) task.title = updateTaskDto.title;
-    if (updateTaskDto.description) task.description = updateTaskDto.description;
-    if (updateTaskDto.status) task.status = updateTaskDto.status;
-    if (updateTaskDto.priority) task.priority = updateTaskDto.priority;
-    if (updateTaskDto.dueDate) task.dueDate = updateTaskDto.dueDate;
-
-    const updatedTask = await this.tasksRepository.save(task);
-
-    // Add to queue if status changed, but without proper error handling
-    if (originalStatus !== updatedTask.status) {
-      this.taskQueue.add('task-status-update', {
-        taskId: updatedTask.id,
-        status: updatedTask.status,
+    try {
+      const task = await queryRunner.manager.findOne(Task, {
+        where: { id },
+        relations: ['user'],
       });
-    }
 
-    return updatedTask;
+      if (!task) {
+        throw new NotFoundException(`Task not found`);
+      }
+
+      const originalStatus = task.status;
+      Object.assign(task, updateTaskDto);
+      
+      const updatedTask = await queryRunner.manager.save(Task, task);
+
+      if (originalStatus !== updatedTask.status) {
+        await this.taskQueue.add('task-status-update', {
+          taskId: updatedTask.id,
+          status: updatedTask.status,
+        }, {
+          attempts: 3,
+          backoff: 5000
+        });
+      }
+
+      await queryRunner.commitTransaction();
+
+      // Invalidate both single task and task list caches
+      await Promise.all([
+        this.cacheService.delete(TASK_CACHE_PATTERNS.SINGLE_TASK(id)),
+        this.cacheService.clear('tasks')
+      ]);
+
+      return updatedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new HttpException(
+        'Failed to update task',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
-    const task = await this.findOne(id);
-    await this.tasksRepository.remove(task);
+    const queryRunner = this.tasksRepository.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const task = await queryRunner.manager.findOne(Task, {
+        where: { id }
+      });
+
+      if (!task) {
+        throw new NotFoundException(`Task not found`);
+      }
+
+      await queryRunner.manager.remove(Task, task);
+      await queryRunner.commitTransaction();
+
+      // Invalidate both single task and task list caches
+      await Promise.all([
+        this.cacheService.delete(TASK_CACHE_PATTERNS.SINGLE_TASK(id)),
+        this.cacheService.clear('tasks')
+      ]);
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw new HttpException(
+        'Failed to delete task',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async findByStatus(status: TaskStatus): Promise<Task[]> {
@@ -93,10 +246,102 @@ export class TasksService {
     return this.tasksRepository.query(query, [status]);
   }
 
-  async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
-    const task = await this.findOne(id);
-    task.status = status as any;
-    return this.tasksRepository.save(task);
+  async updateStatus(id: string, status: TaskStatus): Promise<Task> {
+    const queryRunner = this.tasksRepository.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const task = await queryRunner.manager.findOne(Task, {
+        where: { id }
+      });
+
+      if (!task) {
+        throw new NotFoundException(`Task not found`);
+      }
+
+      task.status = status;
+      const updatedTask = await queryRunner.manager.save(Task, task);
+      await queryRunner.commitTransaction();
+      return updatedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async executeBatchOperation(batchOp: BatchOperationDto): Promise<{ success: true; results: any[] }> {
+    const queryRunner = this.tasksRepository.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const tasks = await queryRunner.manager.find(Task, {
+        where: { id: In(batchOp.taskIds) }
+      });
+
+      if (tasks.length !== batchOp.taskIds.length) {
+        throw new HttpException(
+          'Some tasks were not found',
+          HttpStatus.BAD_REQUEST
+        );
+      }
+
+      const results = [];
+
+      switch (batchOp.operation) {
+        case BatchOperationType.UPDATE_STATUS:
+          if (!batchOp.status) {
+            throw new HttpException(
+              'Status is required for status update operation',
+              HttpStatus.BAD_REQUEST
+            );
+          }
+
+          for (const task of tasks) {
+            task.status = batchOp.status;
+            const updatedTask = await queryRunner.manager.save(Task, task);
+            await this.taskQueue.add('task-status-update', {
+              taskId: updatedTask.id,
+              status: updatedTask.status,
+            }, {
+              attempts: 3,
+              backoff: 5000
+            });
+            results.push(updatedTask);
+          }
+          break;
+
+        case BatchOperationType.DELETE:
+          await queryRunner.manager.remove(Task, tasks);
+          results.push(...tasks.map(t => ({ id: t.id, deleted: true })));
+          break;
+
+        default:
+          throw new HttpException(
+            'Invalid operation type',
+            HttpStatus.BAD_REQUEST
+          );
+      }
+
+      await queryRunner.commitTransaction();
+
+      // Invalidate all affected caches
+      await Promise.all([
+        ...batchOp.taskIds.map(taskId => 
+          this.cacheService.delete(TASK_CACHE_PATTERNS.SINGLE_TASK(taskId))
+        ),
+        this.cacheService.clear('tasks')
+      ]);
+
+      return { success: true, results };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
   }
 }

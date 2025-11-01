@@ -34,10 +34,24 @@ export class CreateInitialSchema1710752400000 implements MigrationInterface {
         CONSTRAINT "fk_user_id" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE
       )
     `);
+
+    await queryRunner.query(`
+      CREATE TABLE IF NOT EXISTS "refresh_tokens" (
+        "id" uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+        "token" varchar NOT NULL,
+        "expires_at" TIMESTAMP NOT NULL,
+        "is_revoked" boolean NOT NULL DEFAULT false,
+        "user_id" uuid NOT NULL,
+        "created_at" TIMESTAMP NOT NULL DEFAULT now(),
+        "updated_at" TIMESTAMP NOT NULL DEFAULT now(),
+        CONSTRAINT "fk_refresh_token_user" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE
+      )
+    `);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`DROP TABLE IF EXISTS "tasks"`);
+    await queryRunner.query(`DROP TABLE IF EXISTS "refresh_tokens"`);
     await queryRunner.query(`DROP TABLE IF EXISTS "users"`);
   }
 } 

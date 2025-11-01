@@ -52,6 +52,20 @@ async function runMigrations() {
           CONSTRAINT "fk_user_id" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE
         )
       `);
+
+      console.log('Creating refresh_tokens table...');
+      await dataSource.query(`
+        CREATE TABLE IF NOT EXISTS "refresh_tokens" (
+          "id" uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+          "token" varchar NOT NULL,
+          "expires_at" TIMESTAMP NOT NULL,
+          "is_revoked" boolean NOT NULL DEFAULT false,
+          "user_id" uuid NOT NULL,
+          "created_at" TIMESTAMP NOT NULL DEFAULT now(),
+          "updated_at" TIMESTAMP NOT NULL DEFAULT now(),
+          CONSTRAINT "fk_refresh_token_user" FOREIGN KEY ("user_id") REFERENCES "users" ("id") ON DELETE CASCADE
+        )
+      `);
       
       console.log('Tables created successfully.');
     }
